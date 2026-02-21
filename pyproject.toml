@@ -1,0 +1,54 @@
+[project]
+name = "nrl-supercoach-ml"
+version = "0.1.0"
+description = "NRL SuperCoach ML optimisation project"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Scraping
+    "playwright>=1.44.0",
+    "beautifulsoup4>=4.12.0",
+
+    # Data wrangling
+    "pandas>=2.2.0",
+    "pyarrow>=16.0.0",
+
+    # PySpark + Delta
+    "pyspark>=3.5.0",
+    "delta-spark>=3.2.0",
+
+    # ML
+    "scikit-learn>=1.5.0",
+    "xgboost>=2.0.0",
+    "lightgbm>=4.3.0",
+
+    # Experiment tracking
+    "mlflow>=2.13.0",
+
+    # Optimisation
+    "pulp>=2.8.0",
+
+    # Utilities
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+    "ipykernel>=6.29.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

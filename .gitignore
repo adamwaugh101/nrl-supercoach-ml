@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# UV / venv
+.venv/
+.python-version
+
+# Environment
+.env
+
+# Data (local scratch only - not committed)
+data/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# MLflow
+mlruns/
+
+# Logs
+*.log
