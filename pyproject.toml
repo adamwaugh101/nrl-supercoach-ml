@@ -11,9 +11,6 @@ dependencies = [
     # Data wrangling
     "pandas>=2.2.0",
     "pyarrow>=16.0.0",
-    # PySpark + Delta
-    "pyspark>=3.5.0",
-    "delta-spark>=3.2.0",
     # ML
     "scikit-learn>=1.5.0",
     "xgboost>=2.0.0",
@@ -27,6 +24,11 @@ dependencies = [
     "loguru>=0.7.0",
     "tqdm>=4.66.0",
     "polars>=1.38.1",
+    "pip>=26.0.1",
+    "azure-ai-ml>=1.31.0",
+    "azure-identity>=1.25.2",
+    "azureml-mlflow>=1.61.0.post1",
+    "ipykernel>=7.2.0",
 ]
 
 [project.optional-dependencies]

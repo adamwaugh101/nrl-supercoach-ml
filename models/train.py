@@ -1,281 +1,208 @@
 # %%
-import sys
-import json
-import numpy as np
+import os
 import polars as pl
-import pandas as pd
+import numpy as np
 from pathlib import Path
-from loguru import logger
+from dotenv import load_dotenv
+from azure.identity import ClientSecretCredential
+from azure.ai.ml import MLClient
+import mlflow
+import mlflow.xgboost
+from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
-from sklearn.preprocessing import LabelEncoder
-import xgboost as xgb
-import lightgbm as lgb
-import joblib
+import argparse
+import pandas as pd
+import matplotlib.pyplot as plt
 
-logger.remove()
-logger.add(sys.stdout, level="INFO")
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # %%
-GOLD_DIR = Path("data/gold")
-MODELS_DIR = Path("data/models")
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
+credential = ClientSecretCredential(
+    tenant_id=os.getenv("AZURE_TENANT_ID"),
+    client_id=os.getenv("AZURE_CLIENT_ID"),
+    client_secret=os.getenv("AZURE_CLIENT_SECRET"),
+)
 
-TRAIN_YEARS = list(range(2015, 2024))  # 2015-2023
-VAL_YEAR = 2024
-TEST_YEAR = 2025
+ml_client = MLClient(
+    credential=credential,
+    subscription_id=os.getenv("AZURE_SUBSCRIPTION_ID"),
+    resource_group_name=os.getenv("AZURE_RESOURCE_GROUP"),
+    workspace_name=os.getenv("AZURE_WORKSPACE_NAME"),
+)
 
-# Features to use for training
-# Exclude target, identifiers, and any columns that would leak future info
-EXCLUDE_COLS = [
-    "score",                # target
-    "player_name",          # identifier
-    "team",                 # will encode separately
-    "opponent",             # will encode separately
-    "position",             # will encode separately
-    "primary_position",     # will encode separately
-    "secondary_position",   # will encode separately
-    "season_price_change",  # leaks full season info
-    "avg_score",            # leaks future rounds
-    "avg_2rd",              # site-calculated, may leak
-    "avg_3rd",              # site-calculated, may leak
-    "avg_5rd",              # site-calculated, may leak
-    "be_gap",
-    "ppm",
-    "avg_be_gap_3rd",
-    "base",
-    "attack", 
-    "playmaking",
-    "power",
-    "negative",
-    "base_power",
-    "base_avg",
-    "scoring_avg",
-    "create_avg",
-    "evade_avg",
-    "negative_avg",
-    "base_power_avg",
-    "base_pct",
-    "base_power_ppm",
-    "h8_pct",
-    "tb_pct",
-    "mt_pct",
-    "ol_il_pct",
-    # Current round action stats — not available before the game
-    "TR", "TS", "LT", "GO", "MG", "FG", "MF", "TA", "MT",
-    "TB", "FD", "OL", "IO", "LB", "LA", "FT", "KB", "H8",
-    "HU", "HG", "IT", "KD", "PC", "ER", "SS",
-    "mins", "bppm", "cv",
-    # Current round scoring breakdown
-    "base", "attack", "playmaking", "power", "negative",
-    "base_power", "base_avg", "scoring_avg", "create_avg",
-    "evade_avg", "negative_avg", "base_power_avg", "base_pct",
-    "base_power_ppm", "h8_pct", "tb_pct", "mt_pct", "ol_il_pct",
-    # Other current-round leakers
-    "be_gap", "avg_be_gap_3rd", "ppm", "avg_pc", "avg_er",
-    "avg_pc_er", "sixty_sixty", "score_rank_in_position",
+# %%
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default="xgboost", choices=["xgboost", "lightgbm"])
+parser.add_argument("--description", type=str, default="No description provided")
+parser.add_argument("--changes", type=str, default="None")
+args = parser.parse_args()
+
+mlflow.set_tracking_uri(os.getenv("AZURE_ML_TRACKING_URI"))
+mlflow.set_experiment("nrl-supercoach-score-prediction")
+mlflow.set_tag("run_description", args.description)
+mlflow.set_tag("changes", args.changes)
+mlflow.set_tag("data_version", "gold_v1")
+
+# %%
+df = pl.read_parquet(Path(__file__).parent.parent / "data/gold/player_rounds_features.parquet")
+print(f"Loaded: {df.shape}")
+
+# %%
+# Shift score forward by 1 within each player+year group to create target
+df = df.sort(["player_name", "year", "round"])
+
+df = df.with_columns(
+    pl.col("score")
+      .shift(-1)
+      .over(["player_name", "year"])
+      .alias("target_score")
+)
+
+# Drop last round of each season (no next round to predict)
+df = df.filter(pl.col("target_score").is_not_null())
+
+print(f"After target shift: {df.shape}")
+# %%
+# Filter out non-playing rows (injured, rested, DNP)
+pre_filter = df.shape[0]
+df = df.filter(pl.col("mins") >= 5)
+post_filter = df.shape[0]
+print(f"Filtered {pre_filter - post_filter} low-minute rows ({pre_filter} → {post_filter})")
+
+# %%
+# Columns to drop from features
+DROP_COLS = [
+    "target_score",
+    "score",           # current round score — would be leakage
+    "player_name",
+    "team",
+    "opponent",
+    "position",
+    "primary_position",
+    "secondary_position",
 ]
 
+# Encode categorical columns before dropping
+df = df.with_columns([
+    pl.col("position").cast(pl.Categorical).to_physical().alias("position_enc"),
+    pl.col("primary_position").cast(pl.Categorical).to_physical().alias("primary_position_enc"),
+    pl.col("team").cast(pl.Categorical).to_physical().alias("team_enc"),
+    pl.col("opponent").cast(pl.Categorical).to_physical().alias("opponent_enc"),
+])
 
 # %%
-def load_data() -> pl.DataFrame:
-    """Load Gold feature dataset."""
-    path = GOLD_DIR / "player_rounds_features.parquet"
-    if not path.exists():
-        raise FileNotFoundError(f"Gold parquet not found at {path}")
-    df = pl.read_parquet(path)
-    logger.info(f"Loaded {len(df)} rows, {len(df.columns)} columns")
-    return df
+# Time-based train/val/test split
+train = df.filter(pl.col("year") <= 2023)
+val   = df.filter(pl.col("year") == 2024)
+test  = df.filter(pl.col("year") == 2025)
 
+feature_cols = [c for c in df.columns if c not in DROP_COLS and c != "year" and c != "round"]
 
-# %%
-def encode_categoricals(df: pd.DataFrame, encoders: dict = None, fit: bool = True) -> tuple[pd.DataFrame, dict]:
-    """Label encode categorical columns."""
-    cat_cols = ["team", "opponent", "position", "primary_position", "secondary_position"]
-    
-    if encoders is None:
-        encoders = {}
+X_train = train.select(feature_cols).to_numpy()
+y_train = train["target_score"].to_numpy()
 
-    for col in cat_cols:
-        if col not in df.columns:
-            continue
-        if fit:
-            le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].fillna("unknown").astype(str))
-            encoders[col] = le
-        else:
-            le = encoders[col]
-            df[col] = df[col].fillna("unknown").astype(str).map(
-                lambda x: le.transform([x])[0] if x in le.classes_ else -1
-            )
+X_val = val.select(feature_cols).to_numpy()
+y_val = val["target_score"].to_numpy()
 
-    return df, encoders
+X_test = test.select(feature_cols).to_numpy()
+y_test = test["target_score"].to_numpy()
 
+print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
 
 # %%
-def get_feature_cols(df: pd.DataFrame) -> list[str]:
-    """Get the list of feature columns to use for training."""
-    return [c for c in df.columns if c not in EXCLUDE_COLS + ["year"]]
+params = {
+    "n_estimators": 500,
+    "max_depth": 6,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "random_state": 42,
+    "n_jobs": -1,
+}
+
+mlflow.end_run()
+
+with mlflow.start_run(run_name=f"{args.model}-baseline"):
+    mlflow.log_params(params)
 
 
-# %%
-def prepare_splits(df: pl.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split data into train, validation, and test sets."""
-    train = df.filter(pl.col("year").is_in(TRAIN_YEARS)).to_pandas()
-    val = df.filter(pl.col("year") == VAL_YEAR).to_pandas()
-    test = df.filter(pl.col("year") == TEST_YEAR).to_pandas()
+    if args.model == "xgboost":
+        from xgboost import XGBRegressor
+        model = XGBRegressor(**params, eval_metric="rmse", early_stopping_rounds=20)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
 
-    logger.info(f"Train: {len(train)} rows ({TRAIN_YEARS[0]}-{TRAIN_YEARS[-1]})")
-    logger.info(f"Val:   {len(val)} rows ({VAL_YEAR})")
-    logger.info(f"Test:  {len(test)} rows ({TEST_YEAR})")
+    elif args.model == "lightgbm":
+        import lightgbm as lgb
+        model = lgb.LGBMRegressor(**params)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(20), lgb.log_evaluation(50)],
+        )
 
-    return train, val, test
+    val_preds = model.predict(X_val)
+    val_mae  = mean_absolute_error(y_val, val_preds)
+    val_rmse = root_mean_squared_error(y_val, val_preds)
 
+    test_preds = model.predict(X_test)
+    test_mae  = mean_absolute_error(y_test, test_preds)
+    test_rmse = root_mean_squared_error(y_test, test_preds)
 
-# %%
-def train_xgboost(X_train, y_train, X_val, y_val) -> xgb.XGBRegressor:
-    """Train XGBoost model."""
-    logger.info("Training XGBoost...")
-    model = xgb.XGBRegressor(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=6,
-        min_child_weight=3,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        random_state=42,
-        n_jobs=-1,
-        early_stopping_rounds=30,
-        eval_metric="mae",
-    )
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=50,
-    )
-    return model
+    mlflow.log_metrics({
+        "val_mae": val_mae,
+        "val_rmse": val_rmse,
+        "test_mae": test_mae,
+        "test_rmse": test_rmse,
+    })
 
+    if args.model == "xgboost":
+        model.save_model("model.json")
+        mlflow.log_artifact("model.json")
+    elif args.model == "lightgbm":
+        model.booster_.save_model("model.txt")
+        mlflow.log_artifact("model.txt")
 
-# %%
-def train_lightgbm(X_train, y_train, X_val, y_val) -> lgb.LGBMRegressor:
-    """Train LightGBM model."""
-    logger.info("Training LightGBM...")
-    model = lgb.LGBMRegressor(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=6,
-        num_leaves=63,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(50)],
-    )
-    return model
+    print(f"Val  — MAE: {val_mae:.2f}, RMSE: {val_rmse:.2f}")
+    print(f"Test — MAE: {test_mae:.2f}, RMSE: {test_rmse:.2f}")
 
+    # Baseline comparisons
+    val_raw = val.select(["target_score", "score_lag_1", "rolling_avg_3"]).to_pandas()
 
-# %%
-def evaluate(model, X, y, label: str, position_col: pd.Series = None):
-    """Evaluate model performance overall and per position."""
-    preds = model.predict(X)
-    mae = mean_absolute_error(y, preds)
-    rmse = root_mean_squared_error(y, preds)
-    logger.info(f"{label} — MAE: {mae:.2f}, RMSE: {rmse:.2f}")
+    baseline_last_week_mae  = mean_absolute_error(val_raw["target_score"], val_raw["score_lag_1"].fillna(0))
+    baseline_last_week_rmse = root_mean_squared_error(val_raw["target_score"], val_raw["score_lag_1"].fillna(0))
 
-    if position_col is not None:
-        results = {}
-        for pos in position_col.unique():
-            mask = position_col == pos
-            if mask.sum() < 10:
-                continue
-            pos_mae = mean_absolute_error(y[mask], preds[mask])
-            pos_rmse = root_mean_squared_error(y[mask], preds[mask])
-            results[pos] = {"mae": round(pos_mae, 2), "rmse": round(pos_rmse, 2)}
-            logger.info(f"  {str(pos):6s} — MAE: {pos_mae:.2f}, RMSE: {pos_rmse:.2f}")
+    baseline_rolling_mae  = mean_absolute_error(val_raw["target_score"], val_raw["rolling_avg_3"].fillna(0))
+    baseline_rolling_rmse = root_mean_squared_error(val_raw["target_score"], val_raw["rolling_avg_3"].fillna(0))
 
-    return preds
+    print(f"Baseline last week  — MAE: {baseline_last_week_mae:.2f}, RMSE: {baseline_last_week_rmse:.2f}")
+    print(f"Baseline 3rd avg    — MAE: {baseline_rolling_mae:.2f}, RMSE: {baseline_rolling_rmse:.2f}")
+    print(f"{args.model.capitalize()} (val)       — MAE: {val_mae:.2f}, RMSE: {val_rmse:.2f}")
 
+    mlflow.log_metrics({
+        "baseline_last_week_mae": baseline_last_week_mae,
+        "baseline_last_week_rmse": baseline_last_week_rmse,
+        "baseline_rolling_mae": baseline_rolling_mae,
+        "baseline_rolling_rmse": baseline_rolling_rmse,
+    })    
 
-# %%
-def ensemble_predict(xgb_preds, lgb_preds, xgb_weight=0.5) -> np.ndarray:
-    """Blend XGBoost and LightGBM predictions."""
-    return xgb_weight * xgb_preds + (1 - xgb_weight) * lgb_preds
+    if args.model == "xgboost":
+        importance = model.feature_importances_
+    elif args.model == "lightgbm":
+        importance = model.feature_importances_
 
-
-# %%
-def run_training():
-    """Full training pipeline."""
-    df = load_data()
-
-    # Drop rows with null scores (DNPs)
-    df = df.filter(pl.col("score").is_not_null())
-
-    train, val, test = prepare_splits(df)
-
-    # Encode categoricals
-    train, encoders = encode_categoricals(train, fit=True)
-    val, _ = encode_categoricals(val, encoders=encoders, fit=False)
-    test, _ = encode_categoricals(test, encoders=encoders, fit=False)
-
-    feature_cols = get_feature_cols(train)
-    logger.info(f"Training with {len(feature_cols)} features")
-
-    X_train = train[feature_cols].fillna(-999)
-    y_train = train["score"]
-    X_val = val[feature_cols].fillna(-999)
-    y_val = val["score"]
-    X_test = test[feature_cols].fillna(-999)
-    y_test = test["score"]
-
-    # Train models
-    xgb_model = train_xgboost(X_train, y_train, X_val, y_val)
-    lgb_model = train_lightgbm(X_train, y_train, X_val, y_val)
-
-    # Evaluate individually
-    logger.info("\n--- XGBoost ---")
-    xgb_val_preds = evaluate(xgb_model, X_val, y_val, "Val", val["primary_position"])
-    xgb_test_preds = evaluate(xgb_model, X_test, y_test, "Test", test["primary_position"])
-
-    logger.info("\n--- LightGBM ---")
-    lgb_val_preds = evaluate(lgb_model, X_val, y_val, "Val", val["primary_position"])
-    lgb_test_preds = evaluate(lgb_model, X_test, y_test, "Test", test["primary_position"])
-
-    # Evaluate ensemble
-    logger.info("\n--- Ensemble (50/50) ---")
-    ens_val_preds = ensemble_predict(xgb_val_preds, lgb_val_preds)
-    ens_test_preds = ensemble_predict(xgb_test_preds, lgb_test_preds)
-    ens_val_mae = mean_absolute_error(y_val, ens_val_preds)
-    ens_test_mae = mean_absolute_error(y_test, ens_test_preds)
-    logger.info(f"Val  — MAE: {ens_val_mae:.2f}")
-    logger.info(f"Test — MAE: {ens_test_mae:.2f}")
-
-    # Save models and encoders
-    joblib.dump(xgb_model, MODELS_DIR / "xgb_model.pkl")
-    joblib.dump(lgb_model, MODELS_DIR / "lgb_model.pkl")
-    joblib.dump(encoders, MODELS_DIR / "encoders.pkl")
-    joblib.dump(feature_cols, MODELS_DIR / "feature_cols.pkl")
-    logger.success("Models saved to data/models/")
-
-    # Save feature importance
-    importance = pd.DataFrame({
+    feature_importance_df = pd.DataFrame({
         "feature": feature_cols,
-        "xgb_importance": xgb_model.feature_importances_,
-        "lgb_importance": lgb_model.feature_importances_,
-    }).sort_values("xgb_importance", ascending=False)
+        "importance": importance
+    }).sort_values("importance", ascending=False).head(30)
 
-    importance.to_csv(MODELS_DIR / "feature_importance.csv", index=False)
-    logger.success("Feature importance saved")
+    fig, ax = plt.subplots(figsize=(10, 12))
+    ax.barh(feature_importance_df["feature"][::-1], feature_importance_df["importance"][::-1])
+    ax.set_xlabel("Importance")
+    ax.set_title(f"{args.model.capitalize()} — Top 30 Feature Importances")
+    plt.tight_layout()
+    plt.savefig("feature_importance.png", dpi=150)
+    mlflow.log_artifact("feature_importance.png")
+    plt.show()
 
-    return xgb_model, lgb_model, encoders, feature_cols
-
-
-# %%
-run_training()
+    print(feature_importance_df.to_string(index=False))
