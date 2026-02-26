@@ -32,7 +32,25 @@ def add_lag_features(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("round_price_change").shift(2).over(["player_name", "year"]).alias("price_change_lag_2"),
     ])
 
+def add_action_score_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Add calculated action score and its lag/rolling features."""
+    action_cols = [
+        "TR", "TA", "GO", "FG", "TB", "MT", "FD", "OL", "IO",
+        "LB", "LA", "IT", "PC", "ER", "HG", "HU", "KB", "SS",
+        "TS", "LT", "MG", "MF", "H8"
+    ]
 
+    # Only sum columns that exist in the dataframe
+    available = [c for c in action_cols if c in df.columns]
+    action_sum = sum(pl.col(c) for c in available)
+
+    return df.with_columns(
+        action_sum.alias("action_score")
+    ).with_columns([
+        pl.col("action_score").shift(1).over(["player_name", "year"]).alias("action_score_lag_1"),
+        pl.col("action_score").rolling_mean(3).over(["player_name", "year"]).alias("action_score_rolling_3"),
+        pl.col("action_score").rolling_mean(5).over(["player_name", "year"]).alias("action_score_rolling_5"),
+    ])
 # %%
 def add_rolling_features(df: pl.DataFrame) -> pl.DataFrame:
     """Add rolling average and std features within each player-season."""
@@ -117,12 +135,22 @@ def add_price_value_features(df: pl.DataFrame) -> pl.DataFrame:
 
 # %%
 def add_opponent_strength(df: pl.DataFrame) -> pl.DataFrame:
-    """Opponent average points allowed per position (historical)."""
+    """Opponent average points allowed per position using only historical data (no leakage)."""
+    df = df.sort(["year", "round"])
+
     opponent_strength = (
-        df.group_by(["opponent", "primary_position"])
-        .agg(pl.col("score").mean().alias("opponent_avg_pts_allowed"))
+        df.select(["year", "round", "opponent", "primary_position", "score"])
+        .with_columns(
+            pl.col("score")
+              .shift(1)
+              .over(["opponent", "primary_position"])
+              .alias("score_lagged")
+        )
+        .group_by(["opponent", "primary_position"])
+        .agg(pl.col("score_lagged").mean().alias("opponent_avg_pts_allowed"))
     )
 
+    df = df.drop("opponent_avg_pts_allowed") if "opponent_avg_pts_allowed" in df.columns else df
     df = df.join(opponent_strength, on=["opponent", "primary_position"], how="left")
 
     return df
@@ -208,6 +236,9 @@ def run_gold_transform():
 
     logger.info("Adding lag features")
     df = add_lag_features(df)
+
+    logger.info("Adding action score features")
+    df = add_action_score_features(df)
 
     logger.info("Adding rolling features")
     df = add_rolling_features(df)

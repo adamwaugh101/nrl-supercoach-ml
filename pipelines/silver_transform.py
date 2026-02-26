@@ -149,10 +149,16 @@ def transform_bronze_to_silver(df: pl.DataFrame) -> pl.DataFrame:
     rename_existing = {k: v for k, v in RENAME_MAP.items() if k in df.columns}
     df = df.rename(rename_existing)
 
+    # Replace "5/8" with "5_8" in position to avoid issues with "/" in column names later
+    df = df.with_columns(
+    pl.col("position").str.replace("5/8", "5_8")
+        )
+
     # Split position into primary and secondary
     df = df.with_columns([
         pl.col("position").str.split(" ").list.get(0).alias("primary_position"),
         pl.col("position").str.split(" ").list.get(1, null_on_oob=True).alias("secondary_position"),
+        
         ])
     
     return df
