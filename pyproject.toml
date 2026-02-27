@@ -31,6 +31,7 @@ dependencies = [
     "ipykernel>=7.2.0",
     "optuna>=4.7.0",
     "optuna-integration>=4.7.0",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
