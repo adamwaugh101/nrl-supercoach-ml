@@ -81,6 +81,8 @@ DROP_COLS = [
     "position",
     "primary_position",
     "secondary_position",
+    "ground_condition",
+    "weather_condition",
 ]
 
 # Encode categorical columns before dropping
@@ -89,6 +91,11 @@ df = df.with_columns([
     pl.col("primary_position").cast(pl.Categorical).to_physical().alias("primary_position_enc"),
     pl.col("team").cast(pl.Categorical).to_physical().alias("team_enc"),
     pl.col("opponent").cast(pl.Categorical).to_physical().alias("opponent_enc"),
+    # --- add these ---
+    pl.col("is_home").cast(pl.Int8),
+    pl.col("is_bye").cast(pl.Int8),
+    pl.col("ground_condition").cast(pl.Categorical).to_physical().alias("ground_condition_enc"),
+    pl.col("weather_condition").cast(pl.Categorical).to_physical().alias("weather_condition_enc"),
 ])
 
 # %%

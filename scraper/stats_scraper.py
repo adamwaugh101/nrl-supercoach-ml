@@ -184,4 +184,4 @@ def run_scrape(start_year: int = START_YEAR, end_year: int = END_YEAR):
 
 
 # %%
-run_scrape(start_year=2015, end_year=2025)
+run_scrape(start_year=2026, end_year=2026)

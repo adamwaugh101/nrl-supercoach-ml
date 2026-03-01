@@ -8,11 +8,53 @@ logger.remove()
 logger.add(sys.stdout, level="INFO")
 
 # %%
+BRONZE_DIR = Path("data/bronze")
 SILVER_DIR = Path("data/silver")
 GOLD_DIR = Path("data/gold")
 GOLD_DIR.mkdir(parents=True, exist_ok=True)
 
 MIN_PRICE = 102400  # SuperCoach minimum player price
+
+
+# Maps all known team name variants → 3-letter silver codes
+TEAM_NAME_MAP = {
+    # Full names / S3 matchup string names
+    "Sea Eagles":           "MNL",
+    "Rabbitohs":            "STH",
+    "Roosters":             "SYD",
+    "Broncos":              "BRO",
+    "Knights":              "NEW",
+    "Raiders":              "CBR",
+    "Storm":                "MEL",
+    "Warriors":             "NZL",
+    "Panthers":             "PTH",
+    "Bulldogs":             "BUL",
+    "Sharks":               "SHA",
+    "Tigers":               "WST",
+    "Eels":                 "PAR",
+    "Titans":               "GCT",
+    "Cowboys":              "NQC",
+    "Dragons":              "STG",
+    "Dolphins":             "DOL",
+    # Alternate long-form names that may appear in older S3 data
+    "Manly":                "MNL",
+    "South Sydney":         "STH",
+    "Sydney Roosters":      "SYD",
+    "Brisbane":             "BRO",
+    "Newcastle":            "NEW",
+    "Canberra":             "CBR",
+    "Melbourne":            "MEL",
+    "New Zealand":          "NZL",
+    "Penrith":              "PTH",
+    "Canterbury":           "BUL",
+    "Cronulla":             "SHA",
+    "Wests Tigers":         "WST",
+    "Parramatta":           "PAR",
+    "Gold Coast":           "GCT",
+    "North Queensland":     "NQC",
+    "St George Illawarra":  "STG",
+    "St. George Illawarra": "STG",
+}
 
 ACTION_COLS = [
     "TR", "TS", "LT", "GO", "MG", "FG", "MF", "TA", "MT",
@@ -21,7 +63,154 @@ ACTION_COLS = [
     "mins", "bppm", "cv"
 ]
 
+
 # %%
+def add_match_context(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Join match context (ground condition, weather, is_home) onto player rounds.
+    Also adds is_bye flag for players whose team has a bye that round.
+
+    Data sources:
+      - data/bronze/match_context/nrl_match_context.parquet   (S3, 2015-2024)
+      - data/bronze/match_context/nrl_match_context_2025.parquet (Playwright scraped)
+    """
+
+    # ── 1. Load and normalise the S3 context (2015-2024) ──────────────────────
+    ctx_path_historical = BRONZE_DIR / "match_context/nrl_match_context.parquet"
+    ctx_path_2025       = BRONZE_DIR / "match_context/nrl_match_context_2025.parquet"
+
+    frames = []
+
+    if ctx_path_historical.exists():
+        ctx_hist = pl.read_parquet(ctx_path_historical).select([
+            "year", "round", "team", "opponent", "is_home",
+            "ground_condition", "weather_condition",
+        ]).with_columns([
+            pl.col("year").cast(pl.Int64),
+            pl.col("round").cast(pl.Int64, strict=False),
+        ])
+        frames.append(ctx_hist)
+
+    if ctx_path_2025.exists():
+        ctx_2025 = pl.read_parquet(ctx_path_2025).select([
+            "year", "round", "team", "opponent", "is_home",
+            "ground_condition", "weather_condition",
+        ]).with_columns([
+            pl.col("year").cast(pl.Int64),
+            pl.col("round").cast(pl.Int64, strict=False),
+        ])
+        frames.append(ctx_2025)
+    else:
+        logger.warning("2025 match context parquet not found — skipping")
+
+    if not frames:
+        logger.warning("No match context data available — skipping join")
+        return df
+
+    ctx = pl.concat(frames, how="diagonal")
+
+    print("Ctx row counts by year:")
+    print(ctx.group_by("year").agg(pl.len().alias("count")).sort("year"))
+
+    # ── 2. Normalise team names in context → 3-letter silver codes ────────────
+    # Build a Polars-compatible replacement expression using when/then chains
+    team_expr = pl.col("team")
+    opp_expr  = pl.col("opponent")
+
+    for name, code in TEAM_NAME_MAP.items():
+        team_expr = pl.when(pl.col("team") == name).then(pl.lit(code)).otherwise(team_expr)
+        opp_expr  = pl.when(pl.col("opponent") == name).then(pl.lit(code)).otherwise(opp_expr)
+
+    ctx = ctx.with_columns([
+        team_expr.alias("team"),
+        opp_expr.alias("opponent"),
+        pl.col("year").cast(pl.Int64),
+        pl.col("round").cast(pl.Int32, strict=False),
+        pl.col("is_home").cast(pl.Boolean),
+    ])
+
+
+    print("Ctx teams BEFORE length filter:")
+    print(ctx["team"].unique().sort())
+
+    # Drop any rows where team code wasn't resolved (shouldn't happen, but safety first)
+    ctx = ctx.filter(pl.col("team").str.len_chars() == 3)
+
+    # ── 3. Derive bye rounds from context ─────────────────────────────────────
+    # Any team that appears in the silver player data for a given year/round
+    # but NOT in the match context has a bye that round.
+    playing = ctx.select(["year", "round", "team"]).unique()
+
+    all_team_rounds = (
+        df.select(["year", "round", "team"])
+        .filter(pl.col("team").str.len_chars() == 3)  # filter out empty 2015 rows
+        .unique()
+    )
+    print("Ctx teams in round 1 2025:")
+    print(playing.filter((pl.col("year") == 2025) & (pl.col("round") == 1)).sort("team"))
+
+    print("Sample playing teams in ctx (year=2025, round=1):")
+    print(playing.filter((pl.col("year") == 2025) & (pl.col("round") == 1)).sort("team"))
+
+    print("\nSilver teams in round 1 2025:")
+    print(all_team_rounds.filter((pl.col("year") == 2025) & (pl.col("round") == 1)).sort("team"))
+
+    bye_rounds = (
+        all_team_rounds
+        .join(playing, on=["year", "round", "team"], how="anti")
+        .with_columns(pl.lit(True).alias("is_bye"))
+    )
+
+    # Debug
+    sample_silver = df.select(["year", "round", "team"]).unique().head(5)
+    sample_ctx = ctx.select(["year", "round", "team"]).unique().head(5)
+    print("Silver sample:")
+    print(sample_silver)
+    print("\nCtx sample:")
+    print(sample_ctx)
+
+    # Try a manual join on one known row
+    test_year = sample_silver["year"][0]
+    test_round = sample_silver["round"][0]
+    test_team = sample_silver["team"][0]
+    print(f"\nLooking for year={test_year}, round={test_round}, team={test_team} in ctx:")
+    print(ctx.filter(
+        (pl.col("year") == test_year) &
+        (pl.col("round") == test_round) &
+        (pl.col("team") == test_team)
+    ))
+
+    # ── 4. Join match context onto player rounds ───────────────────────────────
+    df = df.join(
+        ctx.select(["year", "round", "team", "is_home", "ground_condition", "weather_condition"]),
+        on=["year", "round", "team"],
+        how="left",
+    )
+
+    # ── 5. Join bye flags ──────────────────────────────────────────────────────
+    df = df.join(
+        bye_rounds,
+        on=["year", "round", "team"],
+        how="left",
+    )
+
+    df = df.with_columns(
+        pl.col("is_bye").fill_null(False)
+    )
+
+    logger.info(
+        f"Match context joined — "
+        f"is_home nulls: {df['is_home'].null_count()}, "
+        f"bye rows: {df['is_bye'].sum()}"
+    )
+
+    # Debug — remove after fixing
+    print(df.select(["year", "round"]).dtypes)
+    print(ctx.select(["year", "round"]).dtypes)
+    return df
+
+
+#%%
 def add_lag_features(df: pl.DataFrame) -> pl.DataFrame:
     """Add lag score and price change features within each player-season."""
     return df.with_columns([
@@ -266,6 +455,9 @@ def run_gold_transform():
 
     logger.info("Adding lagged and rolling action stats")
     df = add_lagged_action_stats(df)
+
+    logger.info("Adding match context (home/away, conditions, byes)")
+    df = add_match_context(df)
 
     output_path = GOLD_DIR / "player_rounds_features.parquet"
     df.write_parquet(output_path)
