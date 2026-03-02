@@ -406,6 +406,80 @@ def add_lagged_action_stats(df: pl.DataFrame) -> pl.DataFrame:
 
     return df
 
+# %%
+# Add this function to gold_features.py alongside the other feature functions
+
+def add_player_vs_opponent(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Blended matchup feature — how does this player historically perform
+    against this specific opponent?
+
+    Uses a weighted blend of:
+      - player_vs_opponent_avg: historical avg score vs this opponent
+      - career_avg: overall career average (fallback for sparse matchups)
+
+    Weight is based on number of prior encounters:
+      weight = min(games_vs_opponent / BLEND_THRESHOLD, 1.0)
+      blended = weight * player_vs_opponent_avg + (1 - weight) * career_avg
+
+    Data leakage prevention: only uses scores from prior encounters
+    (shift(1) applied before aggregation).
+    """
+    BLEND_THRESHOLD = 5  # full weight on matchup avg after 5 encounters
+
+    df = df.sort(["player_name", "opponent", "year", "round"])
+
+    # Step 1 — lag the score so we never include the current row
+    df = df.with_columns(
+        pl.col("score")
+          .shift(1)
+          .over(["player_name", "opponent"])
+          .alias("_score_vs_opp_lagged")
+    )
+
+    # Step 2 — cumulative mean and count of prior encounters
+    df = df.with_columns([
+        pl.col("_score_vs_opp_lagged")
+          .cum_sum()
+          .over(["player_name", "opponent"])
+          .alias("_cum_sum_vs_opp"),
+
+        pl.col("_score_vs_opp_lagged")
+          .is_not_null()
+          .cast(pl.Int32)
+          .cum_sum()
+          .over(["player_name", "opponent"])
+          .alias("games_vs_opponent"),
+    ])
+
+    df = df.with_columns(
+        (pl.col("_cum_sum_vs_opp") / pl.col("games_vs_opponent").cast(pl.Float64))
+          .alias("player_vs_opponent_avg")
+    )
+
+    # Step 3 — blend weight based on sample size
+    df = df.with_columns(
+        (pl.col("games_vs_opponent").cast(pl.Float64) / BLEND_THRESHOLD)
+          .clip(upper_bound=1.0)
+          .alias("_matchup_weight")
+    )
+
+    # Step 4 — blended score using career_avg as fallback
+    # career_avg must already exist in df (add_career_avg must run first)
+    df = df.with_columns(
+        pl.when(pl.col("games_vs_opponent") == 0)
+          .then(pl.col("career_avg"))  # no prior matchup data — use career avg
+          .otherwise(
+              pl.col("_matchup_weight") * pl.col("player_vs_opponent_avg") +
+              (1 - pl.col("_matchup_weight")) * pl.col("career_avg")
+          )
+          .alias("matchup_adjusted_avg")
+    )
+
+    # Drop intermediate columns
+    df = df.drop(["_score_vs_opp_lagged", "_cum_sum_vs_opp", "_matchup_weight"])
+
+    return df
 
 # %%
 def run_gold_transform():
@@ -449,6 +523,9 @@ def run_gold_transform():
 
     logger.info("Adding career averages")
     df = add_career_avg(df)
+
+    logger.info("Adding player vs opponent matchup features")
+    df = add_player_vs_opponent(df)
 
     logger.info("Adding price percentiles")
     df = add_price_percentile(df)

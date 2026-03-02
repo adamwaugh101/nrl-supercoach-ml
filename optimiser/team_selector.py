@@ -12,6 +12,8 @@ logger.add(sys.stdout, level="INFO")
 # %%
 REGISTRY_PATH = Path("data/optimiser/player_registry_2026.parquet")
 SALARY_CAP = 11_950_000
+BYE_TEAMS_R1 = {"WST"}
+
 
 POSITION_REQUIREMENTS = {
     "HOK": 2,
@@ -24,7 +26,7 @@ POSITION_REQUIREMENTS = {
 }
 FLEX_COUNT = 1
 TOTAL_PLAYERS = sum(POSITION_REQUIREMENTS.values()) + FLEX_COUNT  # 26
-
+ROUND = 1
 # %%
 registry = pl.read_parquet(REGISTRY_PATH)
 logger.info(f"Registry loaded: {registry.shape}")
@@ -39,6 +41,46 @@ df = df.to_pandas()
 df = df.reset_index(drop=True)
 players = df.index.tolist()
 
+
+# %%
+# Load team lists and filter out reserves
+
+TEAM_LIST_PATH = Path(f"data/optimiser/team_lists_2026_round_{ROUND}.parquet")
+
+
+if TEAM_LIST_PATH.exists():
+    team_lists = pl.read_parquet(TEAM_LIST_PATH)
+    reserves = team_lists.filter(pl.col("status") == "reserve")["player_name"].to_list()
+    df = df[~df["player_name"].isin(reserves)].reset_index(drop=True)
+    players = df.index.tolist()
+    logger.info(f"Removed {len(reserves)} reserves — {len(df)} players remaining")
+else:
+    logger.warning("No team list found — skipping reserve filter")
+
+#%%
+
+#Normalise names for matching — remove apostrophes and trim whitespace
+df["player_name_normalised"] = df["player_name"].str.replace("'", "", regex=False)
+reserves_normalised = [r.replace("'", "") for r in reserves]
+df = df[~df["player_name_normalised"].isin(reserves_normalised)].reset_index(drop=True)
+players = df.index.tolist()
+
+# %%
+# Manual excludes — injured players not yet in team lists
+manual_excludes = ["Mulitalo, Ronaldo", "Bostock, Jack","Bird, Jack"]
+df = df[~df["player_name"].isin(manual_excludes)].reset_index(drop=True)
+players = df.index.tolist()
+logger.info(f"Removed {len(manual_excludes)} manual excludes — {len(df)} players remaining")
+
+
+# Debug name matching
+# registry_names = set(df["player_name"].tolist())
+# reserve_names = set(reserves)
+# matched = registry_names & reserve_names
+# unmatched = reserve_names - registry_names
+
+# logger.info(f"Matched reserves: {matched}")
+# logger.info(f"Unmatched reserves: {unmatched}")    
 # %%
 prob = LpProblem("SuperCoach_Team_Selector", LpMaximize)
 
@@ -54,7 +96,9 @@ flex = LpVariable.dicts("flex", players, cat="Binary")
 # Approximate by maximising total of all 18 — optimiser will naturally
 # prefer higher scorers, the lowest will be the flex insurance
 prob += lpSum(
-    df.loc[i, "predicted_score"] * selected[i] for i in players
+    # df.loc[i, "predicted_score"] * selected[i] for i in players
+    # df.loc[i, "career_avg"] * selected[i] for i in players   
+    df.loc[i, "matchup_adjusted_avg"] * selected[i] for i in players    
 )
 
 # Assignment variables — assign each player to a specific position slot
@@ -72,7 +116,9 @@ for i in players:
 # %%
 # %%
 # Constraints
-
+for i in players:
+    if df.loc[i, "team_2026"] in BYE_TEAMS_R1:
+        prob += selected[i] == 0
 # Total players = 26
 prob += lpSum(selected[i] for i in players) == TOTAL_PLAYERS
 

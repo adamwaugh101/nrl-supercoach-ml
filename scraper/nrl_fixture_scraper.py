@@ -25,7 +25,7 @@ HEADERS = {
 }
 
 MAX_ROUNDS = 30
-YEARS = [2025]
+YEARS = [2026]
 
 # %%
 def fetch_round(year: int, round_num: int, client: httpx.Client) -> list[dict] | None:
