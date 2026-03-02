@@ -6,12 +6,17 @@ import re
 from pathlib import Path
 from loguru import logger
 import sys
+import argparse
 
 logger.remove()
 logger.add(sys.stdout, level="INFO")
 
 # %%
-ROUND = 1
+parser = argparse.ArgumentParser()
+parser.add_argument("--round", type=int, required=True)
+args = parser.parse_args()
+
+ROUND = args.round
 URL = f"https://leagueunlimited.com/news/leagueunlimited-nrl-teams-2026-round-{ROUND}/"
 OUTPUT_PATH = Path(f"data/optimiser/team_lists_2026_round_{ROUND}.parquet")
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)

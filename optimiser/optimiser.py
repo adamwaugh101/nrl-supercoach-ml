@@ -33,6 +33,24 @@ POSITION_REQUIREMENTS = {
 FLEX_COUNT = 1
 TOTAL_PLAYERS = sum(POSITION_REQUIREMENTS.values()) + FLEX_COUNT  # 26
 
+LOCKED_PLAYERS = [
+    "Taumalolo, Jason",
+    "Hess, Coen",
+    "Frizell, Tyson",
+    "Cherry-Evans, Daly",
+    "Fuller, Trai",
+    "Trbojevic, Tom",
+    "Walsh, Reece"
+]
+
+manual_excludes = ["Mulitalo, Ronaldo", 
+                   "Bostock, Jack", 
+                   "Bird, Jack",
+                   "Barnett, Mitchell",
+                   "Gamble, Tyson",
+                   "Brown, Dylan",
+                   "Young, Dominic"]
+
 # %%
 if not PREDICTIONS_PATH.exists():
     logger.error(f"Predictions file not found: {PREDICTIONS_PATH}")
@@ -67,7 +85,7 @@ df = df.reset_index(drop=True)
 
 # %%
 # Manual excludes — injured players not yet in team lists
-manual_excludes = ["Mulitalo, Ronaldo", "Bostock, Jack", "Bird, Jack"]
+
 df = df[~df["player_name"].isin(manual_excludes)].reset_index(drop=True)
 logger.info(f"Removed {len(manual_excludes)} manual excludes — {len(df)} players remaining")
 
@@ -83,6 +101,7 @@ flex     = LpVariable.dicts("flex", players, cat="Binary")
 # Objective — maximise round predicted score (matchup-adjusted)
 prob += lpSum(
     df.loc[i, "round_predicted_score"] * selected[i] for i in players
+    # df.loc[i, "matchup_adjusted_avg"] * selected[i] for i in players    
 )
 
 # %%
@@ -131,6 +150,12 @@ for i in players:
 # Assignment only if selected
 for (i, pos), var in assigned.items():
     prob += var <= selected[i]
+
+# Locked players — must be selected
+for i in players:
+    if df.loc[i, "player_name"] in LOCKED_PLAYERS:
+        prob += selected[i] == 1
+        logger.info(f"Locked: {df.loc[i, 'player_name']}")
 
 # %%
 prob.solve()
