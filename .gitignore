@@ -15,7 +15,8 @@ build/
 
 # Data (local scratch only - not committed)
 data/
-models/artefacts/
+models/artefacts/*.png
+models/artefacts/mlflow.db
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
