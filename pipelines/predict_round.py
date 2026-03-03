@@ -13,8 +13,13 @@ GOLD_PATH         = Path("data/gold/player_rounds_features.parquet")
 FIXTURE_PATH      = Path("data/bronze/fixtures/nrl_fixtures_2026.parquet")
 REGISTRY_PATH     = Path("data/optimiser/player_registry_2026.parquet")
 PLAYER_STATES_PATH = Path("data/gold/player_states.parquet")
+SENTIMENT_PATH    = Path("data/optimiser/sentiment_weights.parquet")
 OUTPUT_DIR        = Path("data/optimiser/predictions")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Weight applied to sentiment_score (-1.0 → 1.0) when adjusting predictions
+# e.g. 0.8 sentiment * 5 = +4 point boost; -1.0 * 5 = -5 point penalty
+SENTIMENT_WEIGHT = 5.0
 
 # Cluster momentum bonus — based on price_momentum_3 and score variance profiles
 # Positive = favour in optimiser, negative = penalise
@@ -104,6 +109,36 @@ def get_latest_player_states() -> pl.DataFrame:
             pl.col("anomaly_score").last(),
         ])
     )
+
+
+def get_sentiment_boosts() -> pl.DataFrame:
+    """
+    Load sentiment_weights.parquet (produced by sentiment_analysis.py) and
+    return a DataFrame with player_name in registry format (Lastname, Firstname)
+    and a sentiment_boost column ready to join onto the registry.
+    Returns an empty DataFrame if the file doesn't exist.
+    """
+    if not SENTIMENT_PATH.exists():
+        logger.warning("sentiment_weights.parquet not found — skipping sentiment boost")
+        return pl.DataFrame(schema={"player_name": pl.String, "sentiment_boost": pl.Float64})
+
+    sentiment = pl.read_parquet(SENTIMENT_PATH)
+
+    # Sentiment names are "Firstname Lastname" — convert to "Lastname, Firstname"
+    def to_registry_fmt(name: str) -> str:
+        parts = name.strip().split()
+        return f"{parts[-1]}, {' '.join(parts[:-1])}" if len(parts) >= 2 else name
+
+    sentiment = sentiment.with_columns(
+        pl.col("player_name")
+          .map_elements(to_registry_fmt, return_dtype=pl.String)
+          .alias("player_name")
+    ).with_columns(
+        (pl.col("sentiment_score").cast(pl.Float64) * SENTIMENT_WEIGHT).alias("sentiment_boost")
+    ).select(["player_name", "sentiment_boost"])
+
+    logger.info(f"Loaded sentiment boosts for {len(sentiment)} players")
+    return sentiment
 
 
 def get_latest_matchup_avgs(gold: pl.DataFrame) -> pl.DataFrame:
@@ -221,12 +256,28 @@ def build_round_predictions(round_num: int) -> pl.DataFrame:
           .alias("cluster_bonus")
     )
 
-    # adjusted_predicted_score = base score + cluster momentum - anomaly penalty
+    # ── Join sentiment boosts ──────────────────────────────────────────────────
+    logger.info("Joining sentiment boosts")
+    sentiment = get_sentiment_boosts()
+
+    if len(sentiment) > 0:
+        registry = registry.join(sentiment, on="player_name", how="left")
+        registry = registry.with_columns(
+            pl.col("sentiment_boost").fill_null(0.0)
+        )
+    else:
+        registry = registry.with_columns(pl.lit(0.0).alias("sentiment_boost"))
+
+    sentiment_matched = (registry["sentiment_boost"] != 0.0).sum()
+    logger.info(f"  Players with sentiment signal: {sentiment_matched} / {len(registry)}")
+
+    # adjusted_predicted_score = base score + cluster momentum - anomaly penalty + sentiment
     registry = registry.with_columns(
         (
             pl.col("round_predicted_score")
             + pl.col("cluster_bonus")
             - (ANOMALY_LAMBDA * pl.col("anomaly_score"))
+            + pl.col("sentiment_boost")
         ).alias("adjusted_predicted_score")
     )
 

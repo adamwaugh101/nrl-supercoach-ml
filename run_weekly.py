@@ -11,6 +11,7 @@ logger.add(sys.stdout, level="INFO")
 parser = argparse.ArgumentParser(description="Run the full weekly SuperCoach pipeline")
 parser.add_argument("--round", type=int, required=True, help="Round number to run")
 parser.add_argument("--skip-refresh", action="store_true", help="Skip data refresh (steps 1-4) and run selection only")
+parser.add_argument("--skip-sentiment", action="store_true", help="Skip commentary scraping and sentiment scoring (use when Playwright is unavailable)")
 args = parser.parse_args()
 
 ROUND = args.round
@@ -21,6 +22,11 @@ REFRESH_STEPS = [
     ("Running silver transform",  ["uv", "run", "python", "pipelines/silver_transform.py"]),
     ("Running gold features",     ["uv", "run", "python", "pipelines/gold_features.py"]),
     ("Building player registry",  ["uv", "run", "python", "optimiser/build_player_registry.py"]),
+]
+
+SENTIMENT_STEPS = [
+    ("Scraping commentary",          ["uv", "run", "python", "scraper/commentary_scraper.py", "--round", str(ROUND)]),
+    ("Scoring commentary sentiment", ["uv", "run", "python", "pipelines/sentiment_analysis.py"]),
 ]
 
 SELECTION_STEPS = [
@@ -48,6 +54,13 @@ if args.skip_refresh:
 else:
     logger.info("--- DATA REFRESH ---")
     for step_name, cmd in REFRESH_STEPS:
+        run_step(step_name, cmd)
+
+if args.skip_sentiment:
+    logger.info("Skipping sentiment steps (--skip-sentiment flag set)")
+else:
+    logger.info("\n--- COMMENTARY & SENTIMENT ---")
+    for step_name, cmd in SENTIMENT_STEPS:
         run_step(step_name, cmd)
 
 logger.info("\n--- ROUND SELECTION ---")

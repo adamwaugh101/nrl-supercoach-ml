@@ -1,17 +1,33 @@
 # %%
+import argparse
 import asyncio
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright
 
 # %%
-URLS = [
-    "https://scplaybook.com.au/blog/2026/02/24/nrl-round-1-team-lists-vegas-squads-nrl-supercoach-analysis",
-    "https://scplaybook.com.au/blog/2026/02/22/nrl-supercoach-cheapie-analysis-forward-bargain-buys",
-    "https://scplaybook.com.au/blog/2026/02/20/nrl-supercoach-cheapie-analysis-backline-bargain-buys",
-]
+parser = argparse.ArgumentParser(description="Scrape SuperCoach commentary articles for a given round")
+parser.add_argument("--round", type=int, required=True, help="Round number to scrape commentary for")
+args = parser.parse_args()
+
+ROUND = args.round
+
+CONFIG_PATH = Path("config/commentary_urls.json")
+if not CONFIG_PATH.exists():
+    print(f"ERROR: {CONFIG_PATH} not found. Create it with round → URL mappings.")
+    sys.exit(1)
+
+url_config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+URLS = url_config.get(str(ROUND), [])
+
+if not URLS:
+    print(f"No commentary URLs configured for round {ROUND}. Add them to {CONFIG_PATH}")
+    sys.exit(0)
+
+print(f"Round {ROUND}: {len(URLS)} URL(s) to scrape")
 
 OUTPUT_DIR = Path("data/raw/commentary")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
