@@ -98,11 +98,10 @@ selected = LpVariable.dicts("selected", players, cat="Binary")
 flex     = LpVariable.dicts("flex", players, cat="Binary")
 
 # %%
-# Objective — maximise round predicted score (matchup-adjusted)
-prob += lpSum(
-    df.loc[i, "round_predicted_score"] * selected[i] for i in players
-    # df.loc[i, "matchup_adjusted_avg"] * selected[i] for i in players    
-)
+# Objective — maximise adjusted predicted score (matchup-adjusted + cluster signal)
+score_col = "adjusted_predicted_score" if "adjusted_predicted_score" in df.columns else "round_predicted_score"
+logger.info(f"Optimising on: {score_col}")
+prob += lpSum(df.loc[i, score_col] * selected[i] for i in players)
 
 # %%
 # Assignment variables
@@ -182,28 +181,34 @@ selected_players = selected_players.sort_values(
 )
 
 # %%
-total_price     = selected_players["price_2026"].sum()
-total_predicted = selected_players["round_predicted_score"].sum()
+total_price      = selected_players["price_2026"].sum()
+score_col        = "adjusted_predicted_score" if "adjusted_predicted_score" in selected_players.columns else "round_predicted_score"
+total_predicted  = selected_players[score_col].sum()
 remaining_budget = SALARY_CAP - total_price
 
 print(f"\n===== SELECTED TEAM — ROUND {ROUND} =====")
-print(f"{'Player':<30} {'Pos':<6} {'Team':<5} {'Opponent':<10} {'Price':>10} {'Career':>8} {'Matchup':>8} {'Pred':>8} {'Flex':>5}")
+print(f"{'Player':<30} {'Pos':<6} {'Team':<5} {'Opp':<5} {'Price':>10} {'Pred':>7} {'Adj':>7} {'Cl':>3} {'Anom':>6} {'Fx':>3}")
 print("-" * 95)
 
 for _, row in selected_players.iterrows():
-    flex_flag  = "✓" if row["is_flex"] else ""
-    matchup    = f"{row['round_matchup_avg']:.1f}" if pd.notna(row.get("round_matchup_avg")) else "—"
-    opponent   = row.get("round_opponent", "")
+    flex_flag    = "Y" if row["is_flex"] else ""
+    opponent     = str(row.get("round_opponent", ""))[:5]
+    pred         = row.get("round_predicted_score", 0)
+    adj          = row.get("adjusted_predicted_score", pred)
+    cluster      = int(row["cluster"]) if pd.notna(row.get("cluster")) else -1
+    anomaly      = row.get("anomaly_score", 0.0)
     print(
         f"{row['player_name']:<30} {row['assigned_position']:<6} {row['team_2026']:<5} "
-        f"{str(opponent):<10} ${row['price_2026']:>9,} {row['career_avg']:>8.1f} "
-        f"{matchup:>8} {row['round_predicted_score']:>8.1f} {flex_flag:>5}"
+        f"{opponent:<5} ${row['price_2026']:>9,} {pred:>7.1f} {adj:>7.1f} "
+        f"{cluster:>3} {anomaly:>6.2f} {flex_flag:>3}"
     )
 
 print("-" * 95)
-print(f"{'TOTAL':<30} {'':6} {'':5} {'':10} ${total_price:>9,} {'':>8} {'':>8} {total_predicted:>8.1f}")
+print(f"{'TOTAL':<30} {'':6} {'':5} {'':5} ${total_price:>9,} {'':>7} {total_predicted:>7.1f}")
 print(f"Remaining budget: ${remaining_budget:,}")
 print(f"Total players: {len(selected_players)}")
+print(f"\nCl = cluster (3=rising premium, 5=consistent premium, 4=declining — see autoencoder.py)")
+print(f"Anom = anomaly score (higher = more unusual situation)")
 
 # %%
 print("\n===== POSITIONAL SLOT COUNT =====")

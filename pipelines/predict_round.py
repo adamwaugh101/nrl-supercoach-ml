@@ -9,11 +9,24 @@ logger.remove()
 logger.add(sys.stdout, level="INFO")
 
 # %%
-GOLD_PATH     = Path("data/gold/player_rounds_features.parquet")
-FIXTURE_PATH  = Path("data/bronze/fixtures/nrl_fixtures_2026.parquet")
-REGISTRY_PATH = Path("data/optimiser/player_registry_2026.parquet")
-OUTPUT_DIR    = Path("data/optimiser/predictions")
+GOLD_PATH         = Path("data/gold/player_rounds_features.parquet")
+FIXTURE_PATH      = Path("data/bronze/fixtures/nrl_fixtures_2026.parquet")
+REGISTRY_PATH     = Path("data/optimiser/player_registry_2026.parquet")
+PLAYER_STATES_PATH = Path("data/gold/player_states.parquet")
+OUTPUT_DIR        = Path("data/optimiser/predictions")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Cluster momentum bonus — based on price_momentum_3 and score variance profiles
+# Positive = favour in optimiser, negative = penalise
+CLUSTER_BONUS = {
+    0:  1,   # Boom-bust mid-tier      (+momentum, high variance)
+    1:  0,   # Steady mid-tier         (flat momentum, low variance)
+    2: -2,   # Declining mid           (negative momentum)
+    3:  3,   # Rising premiums         (strongest positive momentum)
+    4: -4,   # Low/declining cheapies  (strongest negative momentum)
+    5:  2,   # Consistent premiums     (positive momentum, reliable)
+}
+ANOMALY_LAMBDA = 0.5  # risk-aversion weight on anomaly score
 
 # Maps full team names (from fixture scraper) → 3-letter registry codes
 TEAM_NAME_MAP = {
@@ -68,6 +81,31 @@ def get_round_opponents(fixture: pl.DataFrame, round_num: int) -> dict:
 
 
 # %%
+def get_latest_player_states() -> pl.DataFrame:
+    """
+    Load the most recent cluster and anomaly score per player from the
+    autoencoder output. Returns one row per player (latest year + round).
+    Players with no history get cluster=-1 and anomaly_score=0 (neutral).
+    """
+    if not PLAYER_STATES_PATH.exists():
+        logger.warning("player_states.parquet not found — skipping cluster signal")
+        return pl.DataFrame(schema={
+            "player_name": pl.String,
+            "cluster": pl.Int32,
+            "anomaly_score": pl.Float32,
+        })
+
+    states = pl.read_parquet(PLAYER_STATES_PATH)
+    return (
+        states.sort(["player_name", "year", "round"])
+        .group_by("player_name")
+        .agg([
+            pl.col("cluster").last(),
+            pl.col("anomaly_score").last(),
+        ])
+    )
+
+
 def get_latest_matchup_avgs(gold: pl.DataFrame) -> pl.DataFrame:
     """
     For each player/opponent combination, get the most recent
@@ -157,6 +195,43 @@ def build_round_predictions(round_num: int) -> pl.DataFrame:
     logger.info(f"  With matchup history: {registry['round_matchup_avg'].is_not_null().sum()}")
     logger.info(f"  Falling back to career avg: {registry['round_matchup_avg'].is_null().sum()}")
     logger.info(f"  On bye (score=0): {registry['is_bye'].sum()}")
+
+    # ── Join autoencoder cluster signal ───────────────────────────────────────
+    logger.info("Joining player state clusters")
+    player_states = get_latest_player_states()
+
+    if len(player_states) > 0:
+        registry = registry.join(player_states, on="player_name", how="left")
+        registry = registry.with_columns([
+            pl.col("cluster").fill_null(-1).cast(pl.Int32),
+            pl.col("anomaly_score").fill_null(0.0),
+        ])
+    else:
+        registry = registry.with_columns([
+            pl.lit(-1).cast(pl.Int32).alias("cluster"),
+            pl.lit(0.0).alias("anomaly_score"),
+        ])
+
+    # Map cluster → momentum bonus (unknown/new players get 0)
+    cluster_bonus_map = CLUSTER_BONUS
+    registry = registry.with_columns(
+        pl.col("cluster")
+          .replace(cluster_bonus_map, default=0)
+          .cast(pl.Float64)
+          .alias("cluster_bonus")
+    )
+
+    # adjusted_predicted_score = base score + cluster momentum - anomaly penalty
+    registry = registry.with_columns(
+        (
+            pl.col("round_predicted_score")
+            + pl.col("cluster_bonus")
+            - (ANOMALY_LAMBDA * pl.col("anomaly_score"))
+        ).alias("adjusted_predicted_score")
+    )
+
+    matched = (registry["cluster"] >= 0).sum()
+    logger.info(f"  Players with cluster signal: {matched} / {len(registry)}")
 
     return registry
 
