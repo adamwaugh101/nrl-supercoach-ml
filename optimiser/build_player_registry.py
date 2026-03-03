@@ -137,6 +137,35 @@ print(registry.select([
     "predicted_score", "career_avg", "last3_avg", "likely_to_play"
 ]).sort("predicted_score", descending=True).head(20))
 
+# %%
+# Optionally join sentiment weights if commentary analysis has been run
+SENTIMENT_PATH = Path("data/optimiser/sentiment_weights.parquet")
+if SENTIMENT_PATH.exists():
+    sentiment = pl.read_parquet(SENTIMENT_PATH).select([
+        "player_name",
+        pl.col("sentiment_score").alias("sentiment_score"),
+        pl.col("confidence").alias("sentiment_confidence"),
+        pl.col("recommendation").alias("expert_recommendation"),
+        pl.col("key_insight").alias("expert_insight"),
+    ])
+    registry = registry.join(sentiment, on="player_name", how="left")
+
+    # Apply sentiment adjustment: up to ±10% of predicted_score, scaled by confidence
+    registry = registry.with_columns(
+        pl.when(pl.col("sentiment_score").is_not_null())
+          .then(
+              pl.col("predicted_score") * (
+                  1.0 + pl.col("sentiment_score") * pl.col("sentiment_confidence") * 0.10
+              )
+          )
+          .otherwise(pl.col("predicted_score"))
+          .alias("predicted_score")
+    )
+    logger.info(f"Sentiment weights joined: {sentiment.shape[0]} players have expert ratings")
+else:
+    logger.info("No sentiment weights found — skipping (run pipelines/sentiment_analysis.py to generate)")
+
+# %%
 registry.write_parquet(OUTPUT_PATH)
 logger.info(f"Registry saved to {OUTPUT_PATH}")
 

@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(uv run python -c \":*)",
-      "Bash(uv run python models/autoencoder.py)"
+      "Bash(uv run python models/autoencoder.py)",
+      "Bash(python -c \"import json; d=json.load\\(open\\(''data/raw/commentary/blog-2026-02-24-nrl-round-1-team-lists-vegas-squads-nrl-supercoach-analysis.json''\\)\\); print\\(d[''title'']\\); print\\(''---''\\); print\\(d[''body''][:1500]\\)\")"
     ]
   }
 }
